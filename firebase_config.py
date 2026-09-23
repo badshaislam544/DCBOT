@@ -9,13 +9,15 @@ Priority:
 import json
 import os
 import logging
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 log = logging.getLogger("guardian.firebase")
 
 db = None
+_BASE_DIR = Path(__file__).resolve().parent
 
 try:
     import firebase_admin
@@ -37,15 +39,22 @@ try:
             log.info("Firebase connected via FIREBASE_CRED_JSON")
             return db
 
-        if cred_path and os.path.exists(cred_path):
-            firebase_admin.initialize_app(credentials.Certificate(cred_path))
-            db = firestore.client()
-            log.info(f"Firebase connected via {cred_path}")
-            return db
+        # 2. Path from env (backend/.env-এ FIREBASE_CRED_PATH)
+        if cred_path:
+            p = Path(cred_path)
+            if not p.is_absolute():
+                p = _BASE_DIR / p
+            if p.exists():
+                firebase_admin.initialize_app(credentials.Certificate(str(p)))
+                db = firestore.client()
+                log.info(f"Firebase connected via {p}")
+                return db
 
-        if os.path.exists("serviceAccountKey.json"):
+        # 3. Local file fallback (backend/ ফোল্ডারে serviceAccountKey.json)
+        local_key = _BASE_DIR / "serviceAccountKey.json"
+        if local_key.exists():
             firebase_admin.initialize_app(
-                credentials.Certificate("serviceAccountKey.json")
+                credentials.Certificate(str(local_key))
             )
             db = firestore.client()
             log.info("Firebase connected via serviceAccountKey.json")

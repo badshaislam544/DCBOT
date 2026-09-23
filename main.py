@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import urllib.parse
+from pathlib import Path
 
 import discord
 from discord.ext import commands
@@ -25,7 +26,8 @@ from dotenv import load_dotenv
 from firebase_config import db, log_security_event
 
 # ---------- Setup ----------
-load_dotenv()
+# .env সবসময় backend/ ফোল্ডার থেকে লোড হবে (root থেকে রান করলেও)
+load_dotenv(Path(__file__).resolve().parent / ".env")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("guardian")
 
