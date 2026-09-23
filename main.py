@@ -7,13 +7,18 @@ Deploy: GitHub-এ backend/ ফোল্ডারের ভেতরের ফ�
 """
 
 import asyncio
+import base64
+import json
 import logging
 import os
+import urllib.parse
 
 import discord
 from discord.ext import commands
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse
+import requests
 import uvicorn
 from dotenv import load_dotenv
 
@@ -26,6 +31,20 @@ log = logging.getLogger("guardian")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 PORT = int(os.getenv("PORT", "8000"))
+
+# Discord OAuth (Dashboard login-এর জন্য)
+DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
+# Render-এ এটা হবে: https://dcbot-w5ky.onrender.com/auth/callback
+DISCORD_REDIRECT_URI = os.getenv(
+    "DISCORD_REDIRECT_URI", "https://dcbot-w5ky.onrender.com/auth/callback"
+)
+# Login-এর পর কোথায় ফেরত যাবে (Netlify URL, না থাকলে backend root)
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
+# কোন Discord ID-রা Admin (comma-separated), না দিলে সবাই login করতে পারবে
+ADMIN_IDS = {
+    x.strip() for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
+}
 
 # ---------- Discord Bot ----------
 # Developer Portal-এ ON করুন: Server Members Intent + Message Content Intent
@@ -177,7 +196,114 @@ def health():
         "bot_user": str(bot.user) if bot.is_ready() else None,
         "guilds": len(bot.guilds) if bot.is_ready() else 0,
         "firebase": db is not None,
+        "oauth_ready": bool(DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET),
     }
+
+
+# ---------- Discord OAuth Login ----------
+@app.get("/auth/login")
+def auth_login(frontend: str = ""):
+    """Dashboard Login বাটন এখানে আসবে -> Discord-এ পাঠিয়ে দেবে।"""
+    if not DISCORD_CLIENT_ID:
+        return JSONResponse(
+            {"error": "DISCORD_CLIENT_ID সেট নেই (Render env-এ বসান)"},
+            status_code=500,
+        )
+    # frontend মনে রাখি যাতে callback-এর পর সেখানে ফেরত যেতে পারি
+    state = base64.urlsafe_b64encode(
+        json.dumps({"frontend": frontend or FRONTEND_URL}).encode()
+    ).decode()
+    params = urllib.parse.urlencode(
+        {
+            "client_id": DISCORD_CLIENT_ID,
+            "redirect_uri": DISCORD_REDIRECT_URI,
+            "response_type": "code",
+            "scope": "identify guilds",
+            "state": state,
+        }
+    )
+    return RedirectResponse(f"https://discord.com/api/oauth2/authorize?{params}")
+
+
+@app.get("/auth/callback")
+def auth_callback(code: str = "", state: str = ""):
+    """Discord থেকে ফেরত এসে token exchange + user info + frontend-এ redirect।"""
+    if not code:
+        return JSONResponse({"error": "code missing"}, status_code=400)
+    if not (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET):
+        return JSONResponse({"error": "OAuth env সেট নেই"}, status_code=500)
+
+    # frontend URL বের করি
+    frontend = FRONTEND_URL
+    try:
+        if state:
+            frontend = (
+                json.loads(base64.urlsafe_b64decode(state.encode()).decode()).get(
+                    "frontend"
+                )
+                or FRONTEND_URL
+            )
+    except Exception:
+        pass
+
+    # 1. code -> access_token
+    try:
+        token_res = requests.post(
+            "https://discord.com/api/oauth2/token",
+            data={
+                "client_id": DISCORD_CLIENT_ID,
+                "client_secret": DISCORD_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": DISCORD_REDIRECT_URI,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=15,
+        )
+        token_data = token_res.json()
+        access_token = token_data.get("access_token", "")
+        if not access_token:
+            return JSONResponse(
+                {"error": "token exchange failed", "detail": token_data},
+                status_code=400,
+            )
+    except Exception as e:
+        return JSONResponse({"error": f"token error: {e}"}, status_code=500)
+
+    # 2. user info
+    try:
+        me = requests.get(
+            "https://discord.com/api/users/@me",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=15,
+        ).json()
+    except Exception as e:
+        return JSONResponse({"error": f"user fetch failed: {e}"}, status_code=500)
+
+    user_id = str(me.get("id", ""))
+    is_admin = (not ADMIN_IDS) or (user_id in ADMIN_IDS)
+    payload = {
+        "id": user_id,
+        "username": me.get("username", ""),
+        "discriminator": me.get("discriminator", "0"),
+        "avatar": me.get("avatar"),
+        "is_admin": is_admin,
+    }
+    # avatar URL বানিয়ে দিই
+    if payload["avatar"]:
+        payload["avatar_url"] = (
+            f"https://cdn.discordapp.com/avatars/{user_id}/{payload['avatar']}.png"
+        )
+    else:
+        payload["avatar_url"] = (
+            f"https://cdn.discordapp.com/embed/avatars/{int(me.get('discriminator','0')) % 5}.png"
+        )
+
+    # 3. frontend callback-এ পাঠাই (token backend-এ রাখি না — stateless)
+    user_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    if frontend:
+        return RedirectResponse(f"{frontend.rstrip('/')}/callback.html#user={user_b64}")
+    return JSONResponse(payload)
 
 
 @app.get("/events")
