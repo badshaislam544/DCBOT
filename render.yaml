@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: discord-guardian
+    runtime: python
+    # IMPORTANT: Render-এ Root Directory = backend সেট করবেন
+    # অথবা এই repo-র root-এ backend থাকলে buildCommand নিচের মতো:
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: python backend/main.py
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: FIREBASE_CRED_JSON
+        sync: false
+      - key: PORT
+        value: 8000
