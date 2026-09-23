@@ -11,7 +11,9 @@ import base64
 import json
 import logging
 import os
+import time
 import urllib.parse
+from collections import defaultdict, deque
 from pathlib import Path
 
 import discord
@@ -48,6 +50,53 @@ ADMIN_IDS = {
     x.strip() for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
 }
 
+# Alert কোন চ্যানেলে পোস্ট হবে (Channel ID, ফাঁকা রাখলে শুধু Firebase-এ যাবে)
+# Channel-এ Right Click > Copy Channel ID (Developer Mode ON করে)
+LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "").strip()
+
+# ---------- Anti-spam rules (সংখ্যা বদলাতে চাইলে এখানেই) ----------
+SPAM_KEYWORDS = ("free-nitro", "free nitro", "@everyone", "@here", "discord.gg/")
+FLOOD_COUNT_5S = 4      # ৫ সেকেন্ডে ৪টার বেশি মেসেজ = flood
+FLOOD_WINDOW_5S = 5.0
+FAST_COUNT_MIN = 10     # ১ মিনিটে ১০টার বেশি মেসেজ = fast spam
+REPEAT_COUNT_MIN = 3    # ১ মিনিটে একই মেসেজ ৩বার = repeat spam
+IMAGE_COUNT_5S = 2      # ৫ সেকেন্ডে ২টার বেশি ছবি/ফাইল = image spam
+IMAGE_WINDOW_5S = 5.0
+TIMEOUT_SECONDS = 60    # spam করলে কত সেকেন্ড timeout
+
+# ---------- Stats + trackers (memory, restart হলে reset) ----------
+STATS = {"messages_seen": 0, "spam_blocked": 0, "channels_recovered": 0}
+START_TIME = time.time()
+_msg_times: dict[int, deque] = defaultdict(deque)   # user_id -> timestamps
+_img_times: dict[int, deque] = defaultdict(deque)   # user_id -> attachment times
+_last_text: dict[int, tuple[str, int, float]] = {}   # user_id -> (text, repeat, window_start)
+
+
+async def send_log_channel(text: str):
+    """LOG_CHANNEL_ID থাকলে Discord চ্যানেলেও alert পাঠায়।"""
+    if not LOG_CHANNEL_ID or not bot.is_ready():
+        return
+    try:
+        ch = bot.get_channel(int(LOG_CHANNEL_ID))
+        if ch is None:
+            ch = await bot.fetch_channel(int(LOG_CHANNEL_ID))
+        await ch.send(text[:1900])
+    except Exception as e:
+        print(f"Log channel send failed: {e}")
+
+
+async def get_executor(guild: discord.Guild, action: discord.AuditLogAction) -> str:
+    """কে কাজটা করলো (audit log থেকে)। Permission না থাকলে 'unknown'।"""
+    try:
+        async for entry in guild.audit_logs(limit=1, action=action):
+            if time.time() - entry.created_at.timestamp() < 30:
+                return f"{entry.user} (ID: {entry.user.id})"
+    except discord.Forbidden:
+        pass
+    except Exception:
+        pass
+    return "unknown"
+
 # ---------- Discord Bot ----------
 # Developer Portal-এ ON করুন: Server Members Intent + Message Content Intent
 intents = discord.Intents.default()
@@ -63,16 +112,22 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     print(f"Security Guardian Logged in as {bot.user.name} (ID: {bot.user.id})")
     print("Security Guardian is active and watching...")
+    # Deploy/restart-এর পর dashboard-এ অন্তত ১টা log দেখাবে (খালি লাগবে না)
+    log_security_event(
+        "GUARDIAN_ONLINE", f"{bot.user.name} is now watching {len(bot.guilds)} server(s)."
+    )
 
 
 @bot.event
 async def on_guild_channel_delete(channel):
-    guild_name = getattr(getattr(channel, "guild", None), "name", "unknown")
+    guild = getattr(channel, "guild", None)
+    guild_name = getattr(guild, "name", "unknown")
     print(f"Channel Deleted: {channel.name} in {guild_name}. Attempting recovery...")
 
-    log_security_event(
-        "CHANNEL_DELETE", f"Channel #{channel.name} was deleted in {guild_name}."
-    )
+    culprit = await get_executor(guild, discord.AuditLogAction.channel_delete) if guild else "unknown"
+    desc = f"Channel #{channel.name} was deleted in {guild_name} by {culprit}."
+    log_security_event("CHANNEL_DELETE", desc)
+    await send_log_channel(f"⚠️ **Channel deleted:** #{channel.name} | by {culprit}")
 
     try:
         guild = channel.guild
@@ -108,6 +163,8 @@ async def on_guild_channel_delete(channel):
             new_channel = await channel.clone(reason="Guardian auto-recovery")
 
         print(f"Channel #{new_channel.name} successfully recovered!")
+        STATS["channels_recovered"] += 1
+        await send_log_channel(f"✅ **Recovered:** #{new_channel.name} (auto-recreated)")
     except discord.Forbidden:
         print("Failed to recover channel: Missing Permissions (Manage Channels needed).")
     except Exception as e:
@@ -117,48 +174,154 @@ async def on_guild_channel_delete(channel):
 @bot.event
 async def on_guild_role_delete(role):
     print(f"Role deleted: {role.name} in {role.guild.name}")
-    log_security_event(
-        "ROLE_DELETE", f"Role '{role.name}' was deleted in {role.guild.name}."
-    )
+    culprit = await get_executor(role.guild, discord.AuditLogAction.role_delete)
+    desc = f"Role '{role.name}' was deleted in {role.guild.name} by {culprit}."
+    log_security_event("ROLE_DELETE", desc)
+    await send_log_channel(f"⚠️ **Role deleted:** {role.name} | by {culprit}")
 
 
 @bot.event
 async def on_member_ban(guild, user):
     print(f"Member banned: {user} in {guild.name}")
-    log_security_event("MEMBER_BAN", f"{user} was banned in {guild.name}.")
+    culprit = await get_executor(guild, discord.AuditLogAction.ban)
+    desc = f"{user} was banned in {guild.name} by {culprit}."
+    log_security_event("MEMBER_BAN", desc)
+    await send_log_channel(f"🔨 **Ban:** {user} | by {culprit}")
 
 
-SPAM_KEYWORDS = ("free-nitro", "free nitro", "@everyone", "@here")
+@bot.event
+async def on_webhooks_update(channel):
+    """হ্যাকাররা webhook বানিয়ে spam করে — এটা সেই early warning।"""
+    guild_name = getattr(getattr(channel, "guild", None), "name", "unknown")
+    desc = f"Webhooks updated in #{getattr(channel, 'name', '?')} ({guild_name}). Check audit log!"
+    print(f"⚠️ {desc}")
+    log_security_event("WEBHOOK_UPDATE", desc)
+    await send_log_channel(f"🪝 **Webhook change:** {desc}")
+
+
+def _check_rate_spam(user_id: int, text: str, has_attach: bool, now: float) -> str:
+    """Sliding-window চেক। spam হলে কারণ string, না হলে ''।"""
+    # ৫ সেকেন্ডে ৪টার বেশি মেসেজ
+    q = _msg_times[user_id]
+    q.append(now)
+    while q and now - q[0] > FLOOD_WINDOW_5S:
+        q.popleft()
+    if len(q) > FLOOD_COUNT_5S:
+        return f"flood ({len(q)} msgs / 5s)"
+
+    # ১ মিনিটে অনেক মেসেজ (slow flood)
+    if sum(1 for t in q if now - t <= 60) > FAST_COUNT_MIN:
+        return "fast spam (10+ msgs / 1min)"
+
+    # একই মেসেজ বারবার
+    prev_text, prev_n, prev_start = _last_text.get(user_id, ("", 0, now))
+    if text and text == prev_text and now - prev_start <= 60:
+        n = prev_n + 1
+    else:
+        n = 1
+        prev_start = now
+    _last_text[user_id] = (text, n, prev_start)
+    if text and n >= REPEAT_COUNT_MIN:
+        return f"repeat spam (same msg x{n})"
+
+    # ৫ সেকেন্ডে ২টার বেশি ছবি/ফাইল
+    if has_attach:
+        iq = _img_times[user_id]
+        iq.append(now)
+        while iq and now - iq[0] > IMAGE_WINDOW_5S:
+            iq.popleft()
+        if len(iq) > IMAGE_COUNT_5S:
+            return f"image spam ({len(iq)} files / 5s)"
+
+    return ""
+
+
+async def _punish(message: discord.Message, reason: str):
+    """Delete + timeout + Firebase log + log channel।"""
+    author = message.author
+    where = f"#{getattr(message.channel, 'name', 'DM')}"
+    print(f"Spam [{reason}] from {author} in {where}")
+    STATS["spam_blocked"] += 1
+    desc = f"Spam [{reason}] from {author} deleted in {where}."
+    log_security_event("SPAM_DETECTED", desc)
+    await send_log_channel(f"🚨 **Spam blocked:** {author} in {where} | {reason}")
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    # ৬০ সেকেন্ড timeout (permission না থাকলে শুধু delete হবে)
+    try:
+        if message.guild:
+            member = message.guild.get_member(author.id)
+            if member:
+                await member.timeout(
+                    discord.utils.utcnow()
+                    + __import__("datetime").timedelta(seconds=TIMEOUT_SECONDS),
+                    reason=f"Guardian anti-spam: {reason}",
+                )
+    except discord.Forbidden:
+        print("Timeout failed: Moderate Members permission needed.")
+    except Exception as e:
+        print(f"Timeout error: {e}")
+    try:
+        warn = await message.channel.send(
+            f"⚠️ {author.mention}, spam detected ({reason}). {TIMEOUT_SECONDS}s timeout."
+        )
+        await asyncio.sleep(6)
+        await warn.delete()
+    except Exception:
+        pass
+
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    content = message.content.lower()
-    is_spam = (
+    now = time.time()
+    content = (message.content or "").lower().strip()
+    has_attach = bool(message.attachments)
+    STATS["messages_seen"] += 1
+
+    # --- DM (bot-এর inbox): শুধু bot-কে পাঠানো DM দেখা যায় ---
+    if message.guild is None:
+        bad_link = "http://" in content or "free-nitro" in content or "discord.gg/" in content
+        q = _msg_times[message.author.id]
+        q.append(now)
+        while q and now - q[0] > 10:
+            q.popleft()
+        if bad_link or len(q) > 3:
+            await _punish(message, "DM spam")
+            try:
+                await message.channel.send("This inbox is protected by Guardian.")
+            except Exception:
+                pass
+        return
+
+    # --- Server messages ---
+    # Admin/Mod-দের skip (নিজের staff-কে punish করবে না)
+    try:
+        if isinstance(message.author, discord.Member) and message.author.guild_permissions.manage_messages:
+            await bot.process_commands(message)
+            return
+    except Exception:
+        pass
+
+    # ১. Dangerous keyword/link
+    keyword_hit = (
         "http://" in content
         or any(k in content for k in SPAM_KEYWORDS)
         or content.count("https://") >= 3
     )
+    if keyword_hit:
+        await _punish(message, "bad link/keyword")
+        return
 
-    if is_spam:
-        try:
-            await message.delete()
-            print(f"Spam detected and deleted from {message.author}")
-            log_security_event(
-                "SPAM_DETECTED",
-                f"Spam message from {message.author} deleted in #{getattr(message.channel, 'name', 'DM')}.",
-            )
-            warn = await message.channel.send(
-                f"{message.author.mention}, spam link auto-removed by Guardian."
-            )
-            await asyncio.sleep(5)
-            await warn.delete()
-        except discord.Forbidden:
-            print("Spam delete failed: Manage Messages permission needed.")
-        except Exception as e:
-            print(f"Spam handler error: {e}")
+    # ২. Rate-limit rules (৫সে flood / ১মি fast / repeat / image)
+    reason = _check_rate_spam(message.author.id, content, has_attach, now)
+    if reason:
+        await _punish(message, reason)
         return
 
     await bot.process_commands(message)
@@ -172,6 +335,34 @@ async def ping(ctx):
 @bot.command(name="shield")
 async def shield(ctx):
     await ctx.send("Guardian Shield: **ONLINE** — Server is being watched.")
+
+
+@bot.command(name="lockdown")
+@commands.has_guild_permissions(manage_guild=True)
+async def lockdown(ctx):
+    """হ্যাক সন্দেহ হলে সার্ভার freeze: @everyone মেসেজ বন্ধ।"""
+    try:
+        await ctx.channel.set_permissions(
+            ctx.guild.default_role, send_messages=False, reason="Guardian lockdown"
+        )
+        log_security_event("LOCKDOWN", f"Lockdown by {ctx.author} in #{ctx.channel.name}.")
+        await send_log_channel(f"🔒 **Lockdown:** #{ctx.channel.name} by {ctx.author}")
+        await ctx.send("🔒 Channel locked by Guardian.")
+    except discord.Forbidden:
+        await ctx.send("❌ Need Manage Channels permission.")
+
+
+@bot.command(name="unlock")
+@commands.has_guild_permissions(manage_guild=True)
+async def unlock(ctx):
+    try:
+        await ctx.channel.set_permissions(
+            ctx.guild.default_role, send_messages=None, reason="Guardian unlock"
+        )
+        log_security_event("UNLOCK", f"Unlock by {ctx.author} in #{ctx.channel.name}.")
+        await ctx.send("🔓 Channel unlocked.")
+    except discord.Forbidden:
+        await ctx.send("❌ Need Manage Channels permission.")
 
 
 # ---------- FastAPI ----------
@@ -199,6 +390,11 @@ def health():
         "guilds": len(bot.guilds) if bot.is_ready() else 0,
         "firebase": db is not None,
         "oauth_ready": bool(DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET),
+        "uptime_sec": int(time.time() - START_TIME),
+        "messages_seen": STATS["messages_seen"],
+        "spam_blocked": STATS["spam_blocked"],
+        "channels_recovered": STATS["channels_recovered"],
+        "log_channel": bool(LOG_CHANNEL_ID),
     }
 
 
