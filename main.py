@@ -199,7 +199,7 @@ async def on_webhooks_update(channel):
     await send_log_channel(f"🪝 **Webhook change:** {desc}")
 
 
-def _check_rate_spam(user_id: int, text: str, has_attach: bool, now: float) -> str:
+def _check_rate_spam(user_id: int, text: str, attach_count: int, now: float) -> str:
     """Sliding-window চেক। spam হলে কারণ string, না হলে ''।"""
     # ৫ সেকেন্ডে ৪টার বেশি মেসেজ
     q = _msg_times[user_id]
@@ -224,10 +224,15 @@ def _check_rate_spam(user_id: int, text: str, has_attach: bool, now: float) -> s
     if text and n >= REPEAT_COUNT_MIN:
         return f"repeat spam (same msg x{n})"
 
-    # ৫ সেকেন্ডে ২টার বেশি ছবি/ফাইল
-    if has_attach:
+    # এক মেসেজেই অনেক ছবি/ফাইল (যেমন একসাথে ১০টা)
+    if attach_count > IMAGE_COUNT_5S:
+        return f"image spam ({attach_count} files in 1 msg)"
+
+    # ৫ সেকেন্ডে ২টার বেশি ছবি/ফাইল (আলাদা মেসেজে হলেও)
+    if attach_count > 0:
         iq = _img_times[user_id]
-        iq.append(now)
+        for _ in range(attach_count):
+            iq.append(now)
         while iq and now - iq[0] > IMAGE_WINDOW_5S:
             iq.popleft()
         if len(iq) > IMAGE_COUNT_5S:
@@ -281,7 +286,7 @@ async def on_message(message: discord.Message):
 
     now = time.time()
     content = (message.content or "").lower().strip()
-    has_attach = bool(message.attachments)
+    attach_count = len(message.attachments)
     STATS["messages_seen"] += 1
 
     # --- DM (bot-এর inbox): শুধু bot-কে পাঠানো DM দেখা যায় ---
@@ -319,7 +324,7 @@ async def on_message(message: discord.Message):
         return
 
     # ২. Rate-limit rules (৫সে flood / ১মি fast / repeat / image)
-    reason = _check_rate_spam(message.author.id, content, has_attach, now)
+    reason = _check_rate_spam(message.author.id, content, attach_count, now)
     if reason:
         await _punish(message, reason)
         return
